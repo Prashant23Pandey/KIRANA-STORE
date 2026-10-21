@@ -146,11 +146,7 @@ export const App: React.FC = () => {
     // If online, post to server; also save locally in IndexedDB
     try {
       if (health.isOnline) {
-        await fetch('http://127.0.0.1:8000/backend/api/index.php?endpoint=products', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(newProd),
-        });
+        await ApiClient.createProduct(newProd);
       }
     } catch {
       // offline fallback
@@ -178,23 +174,12 @@ export const App: React.FC = () => {
   };
 
   const handleReceiveStock = async (productId: number, addQty: number) => {
-    const clientOpId = 'op-rec-' + Date.now();
     try {
       if (health.isOnline) {
-        await fetch('http://127.0.0.1:8000/backend/api/index.php?endpoint=stock/receive', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            client_op_id: clientOpId,
-            product_id: productId,
-            quantity: addQty,
-            reason: 'Goods Inward Received',
-            device_id: 'counter_01',
-          }),
-        });
+        await ApiClient.receiveStock(productId, addQty, 'Goods Inward Received');
       }
     } catch {
-      // offline
+      // offline fallback
     }
 
     // Update local state and IndexedDB
@@ -209,23 +194,12 @@ export const App: React.FC = () => {
   };
 
   const handleAdjustStock = async (productId: number, exactQty: number) => {
-    const clientOpId = 'op-adj-' + Date.now();
     try {
       if (health.isOnline) {
-        await fetch('http://127.0.0.1:8000/backend/api/index.php?endpoint=stock/adjust', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            client_op_id: clientOpId,
-            product_id: productId,
-            new_quantity: exactQty,
-            reason: 'Physical Audit Correction',
-            device_id: 'counter_01',
-          }),
-        });
+        await ApiClient.adjustStock(productId, exactQty, 'Physical Audit Correction');
       }
     } catch {
-      // offline
+      // offline fallback
     }
 
     const updated = products.map((p) => {

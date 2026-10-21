@@ -1,7 +1,8 @@
 <?php
 /**
  * DukaanSaathi - Authoritative REST API (PHP 8+ & MySQL PDO)
- * Role: PHP/MySQL Engineer
+ * Role: PHP/MySQL Backend Engineer
+ * Specification: Prompt 3 - Production Edition
  */
 
 declare(strict_types=1);
@@ -15,13 +16,26 @@ $config = require __DIR__ . '/../config/config.php';
 
 // 1. CORS Configuration
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-if (in_array($origin, $config['app']['allowed_origins'], true)) {
+$allowedOrigins = $config['app']['allowed_origins'] ?? [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5174',
+    'http://localhost:3000',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    'http://localhost',
+    'http://127.0.0.1',
+];
+
+if (in_array($origin, $allowedOrigins, true)) {
     header("Access-Control-Allow-Origin: $origin");
 } else {
+    // Development fallback
     header("Access-Control-Allow-Origin: *");
 }
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Device-ID');
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Device-ID, X-Client-Version');
 header('Content-Type: application/json; charset=UTF-8');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -49,7 +63,7 @@ function errorResponse(string $message, int $statusCode = 400, ?array $details =
     ], $statusCode);
 }
 
-// 3. Request Parsing
+// 3. Request Routing & Normalization
 $method = $_SERVER['REQUEST_METHOD'];
 $endpoint = $_GET['endpoint'] ?? '';
 
@@ -62,8 +76,20 @@ if (empty($endpoint)) {
 }
 $endpoint = trim($endpoint, '/');
 
-// Parse route segments (e.g. products/12 or products/barcode/8901030383701)
-$segments = explode('/', $endpoint);
+// Parse route segments (e.g. v1/products/12 or products/barcode/8901030383701)
+$segments = array_values(array_filter(explode('/', $endpoint), fn($s) => $s !== ''));
+
+// Normalize leading prefix: 'backend', 'api'
+while (!empty($segments) && in_array(strtolower($segments[0]), ['backend', 'api'], true)) {
+    array_shift($segments);
+}
+
+// Extract API version (defaults to v1)
+$apiVersion = 'v1';
+if (!empty($segments) && preg_match('/^v\d+$/i', $segments[0])) {
+    $apiVersion = strtolower(array_shift($segments));
+}
+
 $resource = $segments[0] ?? '';
 $subResource = $segments[1] ?? null;
 $paramId = $segments[2] ?? null;
@@ -78,10 +104,10 @@ if (!empty($rawInput)) {
     }
 }
 
+// Core Execution Block
 try {
     $pdo = Database::getConnection();
 
-    // 4. API Routing Switch
     switch (true) {
         // =================================================================
         // 4.1 HEALTH & SYSTEM CONNECTIVITY
@@ -90,8 +116,9 @@ try {
             $dbPing = Database::ping();
             jsonResponse([
                 'success' => true,
-                'app' => $config['app']['name'],
-                'version' => $config['app']['version'],
+                'api_version' => $apiVersion,
+                'app' => $config['app']['name'] ?? 'DukaanSaathi Kirana System',
+                'version' => $config['app']['version'] ?? '1.0.0',
                 'php_version' => PHP_VERSION,
                 'database' => $dbPing,
                 'server_time' => gmdate('Y-m-d\TH:i:s\Z'),
@@ -99,7 +126,27 @@ try {
             break;
 
         // =================================================================
-        // 4.2 PRODUCTS: GET / BARCODE LOOKUP / DETAILS
+        // 4.2 BARCODE LOOKUP (Direct /barcode/{code} or query ?code=...)
+        // =================================================================
+        case ($resource === 'barcode' && $method === 'GET'):
+            $barcode = $subResource ?? ($_GET['code'] ?? ($_GET['barcode'] ?? null));
+            if (!$barcode) {
+                errorResponse("Barcode parameter is required.", 422);
+            }
+
+            $stmt = $pdo->prepare("SELECT * FROM `products` WHERE `barcode` = :barcode AND `is_active` = 1 LIMIT 1");
+            $stmt->execute(['barcode' => $barcode]);
+            $product = $stmt->fetch();
+
+            if ($product) {
+                jsonResponse(['success' => true, 'data' => $product]);
+            } else {
+                errorResponse("Product with barcode '$barcode' not found in store catalog.", 404);
+            }
+            break;
+
+        // =================================================================
+        // 4.3 PRODUCTS: LIST / DETAILS / BARCODE
         // =================================================================
         case ($resource === 'products' && $method === 'GET'):
             // Barcode lookup via path: /products/barcode/{code} or query ?barcode={code}
@@ -118,19 +165,20 @@ try {
                 }
             }
 
-            // Single Product Details via path: /products/{id}
-            if ($subResource && is_numeric($subResource)) {
+            // Single Product Details via path: /products/{id} or query ?id={id}
+            $singleId = ($subResource && is_numeric($subResource)) ? (int)$subResource : (isset($_GET['id']) ? (int)$_GET['id'] : null);
+            if ($singleId !== null) {
                 $stmt = $pdo->prepare("SELECT * FROM `products` WHERE `id` = :id LIMIT 1");
-                $stmt->execute(['id' => (int)$subResource]);
+                $stmt->execute(['id' => $singleId]);
                 $product = $stmt->fetch();
                 if ($product) {
                     jsonResponse(['success' => true, 'data' => $product]);
                 } else {
-                    errorResponse("Product ID '$subResource' not found.", 404);
+                    errorResponse("Product ID '$singleId' not found.", 404);
                 }
             }
 
-            // Products List & Search
+            // Products Catalog Search & Filter
             $search = $_GET['q'] ?? null;
             $category = $_GET['category'] ?? null;
 
@@ -138,8 +186,11 @@ try {
             $params = [];
 
             if ($search) {
-                $sql .= " AND (`name_en` LIKE :q OR `name_hi` LIKE :q OR `sku_code` LIKE :q OR `barcode` LIKE :q)";
-                $params['q'] = "%$search%";
+                $sql .= " AND (`name_en` LIKE :q1 OR `name_hi` LIKE :q2 OR `sku_code` LIKE :q3 OR `barcode` LIKE :q4)";
+                $params['q1'] = "%$search%";
+                $params['q2'] = "%$search%";
+                $params['q3'] = "%$search%";
+                $params['q4'] = "%$search%";
             }
             if ($category && $category !== 'All') {
                 $sql .= " AND `category` = :cat";
@@ -160,10 +211,10 @@ try {
             break;
 
         // =================================================================
-        // 4.3 PRODUCTS: CREATE / UPDATE
+        // 4.4 PRODUCTS: CREATE / UPDATE
         // =================================================================
         case ($resource === 'products' && ($method === 'POST' || $method === 'PUT')):
-            $productId = ($subResource && is_numeric($subResource)) ? (int)$subResource : null;
+            $productId = ($subResource && is_numeric($subResource)) ? (int)$subResource : (isset($body['id']) ? (int)$body['id'] : null);
 
             $nameEn = trim($body['name_en'] ?? '');
             if (empty($nameEn)) {
@@ -179,7 +230,7 @@ try {
             $category = !empty($body['category']) ? trim($body['category']) : 'Groceries';
             $unit = !empty($body['unit']) ? trim($body['unit']) : 'packet';
             $barcode = !empty($body['barcode']) ? trim($body['barcode']) : null;
-            $costPrice = (float)($body['cost_price'] ?? ($price * 0.85));
+            $costPrice = isset($body['cost_price']) ? (float)$body['cost_price'] : round($price * 0.85, 2);
             $stockQty = (float)($body['stock_qty'] ?? 0.0);
             $lowStock = (float)($body['low_stock_threshold'] ?? 5.0);
             $leadTime = (int)($body['lead_time_days'] ?? 2);
@@ -191,6 +242,7 @@ try {
                     `name_en` = :name_en, `name_hi` = :name_hi, `category` = :cat, `unit` = :unit,
                     `price` = :price, `cost_price` = :cost_price, `low_stock_threshold` = :low_stock,
                     `lead_time_days` = :lead_time, `safety_stock_qty` = :safety_stock,
+                    `barcode` = COALESCE(:barcode, `barcode`),
                     `version` = `version` + 1
                     WHERE `id` = :id");
 
@@ -204,6 +256,7 @@ try {
                     'low_stock' => $lowStock,
                     'lead_time' => $leadTime,
                     'safety_stock' => $safetyStock,
+                    'barcode' => $barcode,
                     'id' => $productId,
                 ]);
 
@@ -240,7 +293,7 @@ try {
             break;
 
         // =================================================================
-        // 4.4 STOCK: RECEIVE STOCK / INVENTORY ADJUSTMENT
+        // 4.5 STOCK: RECEIPT (PURCHASE INWARD)
         // =================================================================
         case ($resource === 'stock' && $subResource === 'receive' && $method === 'POST'):
             $clientOpId = trim($body['client_op_id'] ?? '');
@@ -307,6 +360,9 @@ try {
             ]);
             break;
 
+        // =================================================================
+        // 4.6 STOCK: ADJUSTMENT (PHYSICAL AUDIT)
+        // =================================================================
         case ($resource === 'stock' && $subResource === 'adjust' && $method === 'POST'):
             $clientOpId = trim($body['client_op_id'] ?? '');
             $productId = (int)($body['product_id'] ?? 0);
@@ -365,7 +421,7 @@ try {
             break;
 
         // =================================================================
-        // 4.5 BILLS: TRANSACTIONAL CREATION WITH STRICT STOCK VALIDATION
+        // 4.7 BILLS: TRANSACTIONAL CREATION WITH STRICT STOCK VALIDATION
         // =================================================================
         case ($resource === 'bills' && $method === 'POST'):
             $clientOpId = trim($body['client_op_id'] ?? '');
@@ -404,6 +460,16 @@ try {
             $clientTime = !empty($body['created_at']) ? $body['created_at'] : date('Y-m-d H:i:s');
             $billNo = trim($body['bill_no'] ?? 'DS-' . date('Ymd') . '-' . substr(strtoupper($clientOpId), 0, 6));
 
+            // Compute total requested quantity per product ID to prevent intra-bill race conditions
+            $productDemand = [];
+            foreach ($rawItems as $item) {
+                if (!empty($item['product_id'])) {
+                    $pid = (int)$item['product_id'];
+                    $qty = (float)($item['quantity'] ?? 1.0);
+                    $productDemand[$pid] = ($productDemand[$pid] ?? 0.0) + $qty;
+                }
+            }
+
             // START DATABASE TRANSACTION
             $pdo->beginTransaction();
 
@@ -417,6 +483,34 @@ try {
                 (`client_op_id`, `product_id`, `bill_id`, `quantity_delta`, `balance_after`, `reason`, `operation_type`, `device_id`)
                 VALUES (:op_id, :prod_id, :bill_id, :delta, :bal, :reason, 'sale', :device_id)");
 
+            // Pre-validate aggregated stock demand
+            $cachedProducts = [];
+            foreach ($productDemand as $pid => $totalRequested) {
+                $lockStmt->execute(['id' => $pid]);
+                $dbProduct = $lockStmt->fetch();
+                if (!$dbProduct) {
+                    $pdo->rollBack();
+                    errorResponse("Product ID $pid no longer exists in store catalog.", 404);
+                }
+
+                $availableStock = (float)$dbProduct['stock_qty'];
+                if ($availableStock < $totalRequested) {
+                    $pdo->rollBack();
+                    errorResponse(
+                        "Insufficient stock for '{$dbProduct['name_en']}'. Available: {$availableStock} {$dbProduct['unit']}, Total Requested: {$totalRequested}.",
+                        409,
+                        [
+                            'conflict_type' => 'INSUFFICIENT_STOCK',
+                            'product_id' => $pid,
+                            'available_stock' => $availableStock,
+                            'requested_qty' => $totalRequested,
+                        ]
+                    );
+                }
+                $cachedProducts[$pid] = $dbProduct;
+            }
+
+            // Calculate authoritative item totals
             foreach ($rawItems as $index => $item) {
                 $prodId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
                 $reqQty = (float)($item['quantity'] ?? 1.0);
@@ -426,30 +520,8 @@ try {
                 }
 
                 if ($prodId !== null) {
-                    $lockStmt->execute(['id' => $prodId]);
-                    $dbProduct = $lockStmt->fetch();
-                    if (!$dbProduct) {
-                        $pdo->rollBack();
-                        errorResponse("Product ID $prodId no longer exists.", 404);
-                    }
-
-                    // Stock check: reject if insufficient stock
-                    $currentStock = (float)$dbProduct['stock_qty'];
-                    if ($currentStock < $reqQty) {
-                        $pdo->rollBack();
-                        errorResponse(
-                            "Insufficient stock for '{$dbProduct['name_en']}'. Available: {$currentStock} {$dbProduct['unit']}, Requested: {$reqQty}.",
-                            409,
-                            [
-                                'conflict_type' => 'INSUFFICIENT_STOCK',
-                                'product_id' => $prodId,
-                                'available_stock' => $currentStock,
-                                'requested_qty' => $reqQty,
-                            ]
-                        );
-                    }
-
-                    // Authoritative pricing from catalog
+                    $dbProduct = $cachedProducts[$prodId];
+                    // Authoritative pricing from catalog (never trust browser price)
                     $unitPrice = (float)$dbProduct['price'];
                     $lineTotal = round($unitPrice * $reqQty, 2);
                     $nameSnapshot = $dbProduct['name_en'];
@@ -572,16 +644,17 @@ try {
             break;
 
         // =================================================================
-        // 4.6 BILLS: LIST & DETAILS RETRIEVAL
+        // 4.8 BILLS: LIST & DETAILS RETRIEVAL
         // =================================================================
         case ($resource === 'bills' && $method === 'GET'):
-            // Specific Bill Details: /bills/{id}
-            if ($subResource && is_numeric($subResource)) {
+            // Specific Bill Details: /bills/{id} or query ?id={id}
+            $singleBillId = ($subResource && is_numeric($subResource)) ? (int)$subResource : (isset($_GET['id']) ? (int)$_GET['id'] : null);
+            if ($singleBillId !== null) {
                 $billStmt = $pdo->prepare("SELECT * FROM `bills` WHERE `id` = :id LIMIT 1");
-                $billStmt->execute(['id' => (int)$subResource]);
+                $billStmt->execute(['id' => $singleBillId]);
                 $bill = $billStmt->fetch();
                 if (!$bill) {
-                    errorResponse("Bill ID '$subResource' not found.", 404);
+                    errorResponse("Bill ID '$singleBillId' not found.", 404);
                 }
 
                 $itemsStmt = $pdo->prepare("SELECT * FROM `bill_items` WHERE `bill_id` = :bid");
@@ -595,6 +668,7 @@ try {
             $date = $_GET['date'] ?? null;
             $phone = $_GET['phone'] ?? null;
             $limit = min(100, max(1, (int)($_GET['limit'] ?? 50)));
+            $offset = max(0, (int)($_GET['offset'] ?? 0));
 
             $sql = "SELECT b.*, COUNT(bi.id) as item_count
                 FROM `bills` b
@@ -614,7 +688,7 @@ try {
                 $params['p'] = "%$phone%";
             }
 
-            $sql .= " GROUP BY b.id ORDER BY b.created_at DESC LIMIT $limit";
+            $sql .= " GROUP BY b.id ORDER BY b.created_at DESC LIMIT $limit OFFSET $offset";
 
             $stmt = $pdo->prepare($sql);
             $stmt->execute($params);
@@ -624,16 +698,23 @@ try {
             break;
 
         // =================================================================
-        // 4.7 ANALYTICS: SERVER-CALCULATED AGGREGATIONS
+        // 4.9 ANALYTICS: SERVER-CALCULATED AGGREGATIONS
         // =================================================================
         case ($resource === 'analytics' && $method === 'GET'):
             $period = $_GET['period'] ?? 'today';
 
-            $dateClause = "DATE(created_at) = CURDATE()";
+            $billDateClause = "DATE(created_at) = CURDATE()";
+            $itemDateClause = "DATE(b.created_at) = CURDATE()";
+
             if ($period === 'week') {
-                $dateClause = "created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)";
+                $billDateClause = "created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)";
+                $itemDateClause = "b.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)";
             } elseif ($period === 'month') {
-                $dateClause = "created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)";
+                $billDateClause = "created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)";
+                $itemDateClause = "b.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)";
+            } elseif ($period === 'all') {
+                $billDateClause = "1=1";
+                $itemDateClause = "1=1";
             }
 
             // Summary aggregates
@@ -643,8 +724,9 @@ try {
                 COALESCE(AVG(total_amount), 0) as average_bill,
                 COALESCE(SUM(CASE WHEN payment_mode = 'cash' THEN total_amount ELSE 0 END), 0) as cash_revenue,
                 COALESCE(SUM(CASE WHEN payment_mode = 'upi' THEN total_amount ELSE 0 END), 0) as upi_revenue,
-                COALESCE(SUM(CASE WHEN payment_mode = 'credit' THEN total_amount ELSE 0 END), 0) as credit_revenue
-                FROM `bills` WHERE $dateClause");
+                COALESCE(SUM(CASE WHEN payment_mode = 'credit' THEN total_amount ELSE 0 END), 0) as credit_revenue,
+                COALESCE(SUM(CASE WHEN payment_mode = 'card' THEN total_amount ELSE 0 END), 0) as card_revenue
+                FROM `bills` WHERE $billDateClause");
             $summary = $summaryStmt->fetch();
 
             // Top selling products in timeframe
@@ -654,7 +736,7 @@ try {
                 SUM(bi.total_price) as total_revenue
                 FROM `bill_items` bi
                 JOIN `bills` b ON bi.bill_id = b.id
-                WHERE b.$dateClause
+                WHERE $itemDateClause
                 GROUP BY bi.product_name_snapshot
                 ORDER BY total_qty DESC
                 LIMIT 5");
@@ -670,13 +752,14 @@ try {
                     'cash_revenue' => (float)$summary['cash_revenue'],
                     'upi_revenue' => (float)$summary['upi_revenue'],
                     'credit_revenue' => (float)$summary['credit_revenue'],
+                    'card_revenue' => (float)$summary['card_revenue'],
                 ],
                 'top_moving_items' => $topItems,
             ]);
             break;
 
         // =================================================================
-        // 4.8 BATCH SYNC: MULTI-OPERATION OFFLINE FLUSHER
+        // 4.10 BATCH SYNC: MULTI-OPERATION OFFLINE FLUSHER & CONFLICT HANDLER
         // =================================================================
         case ($resource === 'sync' && $method === 'POST'):
             $operations = $body['operations'] ?? [];
@@ -684,7 +767,7 @@ try {
                 errorResponse("Expected array 'operations' in payload.", 422);
             }
 
-            $deviceId = trim($body['device_id'] ?? 'unknown_device');
+            $deviceId = trim($body['device_id'] ?? 'counter_01');
             $results = [];
 
             foreach ($operations as $op) {
@@ -698,27 +781,218 @@ try {
                     continue;
                 }
 
-                // Check duplicate
+                // Check duplicate across sync operations
                 $check = $pdo->prepare("SELECT * FROM `sync_operations` WHERE `client_op_id` = :op_id LIMIT 1");
                 $check->execute(['op_id' => $opId]);
-                if ($check->fetch()) {
-                    $results[] = ['client_op_id' => $opId, 'status' => 'ignored_duplicate'];
+                $existingSync = $check->fetch();
+                if ($existingSync) {
+                    $results[] = [
+                        'client_op_id' => $opId,
+                        'status' => 'ignored_duplicate',
+                        'previous_status' => $existingSync['processing_status'],
+                        'message' => 'Operation already registered previously',
+                    ];
                     continue;
                 }
 
-                // Record operation
-                $log = $pdo->prepare("INSERT INTO `sync_operations`
-                    (`client_op_id`, `device_id`, `operation_type`, `entity_type`, `payload_json`, `processing_status`, `client_timestamp`)
-                    VALUES (:op_id, :device_id, :op_type, :entity_type, :payload, 'applied', NOW())");
-                $log->execute([
-                    'op_id' => $opId,
-                    'device_id' => $deviceId,
-                    'op_type' => $opType,
-                    'entity_type' => $entityType,
-                    'payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
-                ]);
+                // Execute operation based on type
+                if ($entityType === 'bill' && $opType === 'create_bill') {
+                    // Check if bill already exists
+                    $bCheck = $pdo->prepare("SELECT id, bill_no FROM `bills` WHERE `client_op_id` = :op_id LIMIT 1");
+                    $bCheck->execute(['op_id' => $opId]);
+                    $exBill = $bCheck->fetch();
 
-                $results[] = ['client_op_id' => $opId, 'status' => 'applied'];
+                    if ($exBill) {
+                        $results[] = ['client_op_id' => $opId, 'status' => 'ignored_duplicate', 'bill_id' => $exBill['id']];
+                        continue;
+                    }
+
+                    // Process bill creation
+                    $items = $payload['items'] ?? [];
+                    $conflictFound = false;
+                    $conflictReason = '';
+
+                    // Pre-verify stock
+                    $pdo->beginTransaction();
+                    foreach ($items as $itm) {
+                        $pid = !empty($itm['product_id']) ? (int)$itm['product_id'] : null;
+                        $qty = (float)($itm['quantity'] ?? 1);
+                        if ($pid) {
+                            $stkCheck = $pdo->prepare("SELECT id, name_en, stock_qty FROM `products` WHERE `id` = :id FOR UPDATE");
+                            $stkCheck->execute(['id' => $pid]);
+                            $prodRow = $stkCheck->fetch();
+                            if (!$prodRow || (float)$prodRow['stock_qty'] < $qty) {
+                                $conflictFound = true;
+                                $conflictReason = "Insufficient stock for " . ($prodRow['name_en'] ?? "Product #$pid");
+                                break;
+                            }
+                        }
+                    }
+
+                    if ($conflictFound) {
+                        $pdo->rollBack();
+                        // Record conflict in sync operations registry
+                        $syncLog = $pdo->prepare("INSERT INTO `sync_operations`
+                            (`client_op_id`, `device_id`, `operation_type`, `entity_type`, `payload_json`, `processing_status`, `response_metadata_json`, `client_timestamp`)
+                            VALUES (:op_id, :device_id, :op_type, :entity_type, :payload, 'conflict', :meta, NOW())");
+                        $syncLog->execute([
+                            'op_id' => $opId,
+                            'device_id' => $deviceId,
+                            'op_type' => $opType,
+                            'entity_type' => $entityType,
+                            'payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+                            'meta' => json_encode(['error' => $conflictReason, 'code' => 'INSUFFICIENT_STOCK']),
+                        ]);
+
+                        $results[] = [
+                            'client_op_id' => $opId,
+                            'status' => 'conflict',
+                            'conflict_type' => 'INSUFFICIENT_STOCK',
+                            'message' => $conflictReason,
+                        ];
+                        continue;
+                    }
+
+                    // Apply bill creation
+                    $subtotal = 0.0;
+                    foreach ($items as $itm) {
+                        $subtotal += round((float)($itm['unit_price'] ?? 0) * (float)($itm['quantity'] ?? 1), 2);
+                    }
+                    $discount = (float)($payload['discount_amount'] ?? 0);
+                    $total = max(0.0, round($subtotal - $discount, 2));
+                    $billNo = $payload['bill_no'] ?? ('DS-' . date('Ymd') . '-' . substr(strtoupper($opId), 0, 6));
+
+                    $insBill = $pdo->prepare("INSERT INTO `bills`
+                        (`shop_id`, `bill_no`, `client_op_id`, `customer_name`, `customer_phone`, `subtotal`, `tax_amount`, `discount_amount`, `total_amount`, `payment_mode`, `payment_status`, `device_id`, `created_at`)
+                        VALUES (1, :bill_no, :op_id, :cname, :cphone, :sub, 0, :disc, :tot, :pmode, 'paid', :did, :ctime)");
+                    $insBill->execute([
+                        'bill_no' => $billNo,
+                        'op_id' => $opId,
+                        'cname' => $payload['customer_name'] ?? null,
+                        'cphone' => $payload['customer_phone'] ?? null,
+                        'sub' => $subtotal,
+                        'disc' => $discount,
+                        'tot' => $total,
+                        'pmode' => $payload['payment_mode'] ?? 'cash',
+                        'did' => $deviceId,
+                        'ctime' => $payload['created_at'] ?? date('Y-m-d H:i:s'),
+                    ]);
+                    $newBillId = (int)$pdo->lastInsertId();
+
+                    $insItem = $pdo->prepare("INSERT INTO `bill_items`
+                        (`bill_id`, `product_id`, `product_name_snapshot`, `unit`, `quantity`, `unit_price`, `total_price`)
+                        VALUES (:bid, :pid, :name, :unit, :qty, :price, :tot)");
+                    $deductStk = $pdo->prepare("UPDATE `products` SET `stock_qty` = `stock_qty` - :qty, `version` = `version` + 1 WHERE `id` = :id");
+                    $movStmt = $pdo->prepare("INSERT INTO `stock_movements`
+                        (`client_op_id`, `product_id`, `bill_id`, `quantity_delta`, `balance_after`, `reason`, `operation_type`, `device_id`)
+                        VALUES (:op_id, :pid, :bid, :delta, :bal, :reason, 'sale', :did)");
+
+                    foreach ($items as $idx => $itm) {
+                        $pid = !empty($itm['product_id']) ? (int)$itm['product_id'] : null;
+                        $qty = (float)($itm['quantity'] ?? 1);
+                        $uprice = (float)($itm['unit_price'] ?? 0);
+                        $totPrice = round($qty * $uprice, 2);
+
+                        $insItem->execute([
+                            'bid' => $newBillId,
+                            'pid' => $pid,
+                            'name' => $itm['product_name_snapshot'] ?? ($itm['name_en'] ?? "Item #" . ($idx + 1)),
+                            'unit' => $itm['unit'] ?? 'pc',
+                            'qty' => $qty,
+                            'price' => $uprice,
+                            'tot' => $totPrice,
+                        ]);
+
+                        if ($pid) {
+                            $deductStk->execute(['qty' => $qty, 'id' => $pid]);
+                            $balSt = $pdo->prepare("SELECT stock_qty FROM `products` WHERE id = :id");
+                            $balSt->execute(['id' => $pid]);
+                            $remBal = (float)$balSt->fetchColumn();
+
+                            $movStmt->execute([
+                                'op_id' => $opId . '-sync-' . $idx,
+                                'pid' => $pid,
+                                'bid' => $newBillId,
+                                'delta' => -$qty,
+                                'bal' => $remBal,
+                                'reason' => "Offline Sync Bill #$billNo",
+                                'did' => $deviceId,
+                            ]);
+                        }
+                    }
+
+                    $syncLog = $pdo->prepare("INSERT INTO `sync_operations`
+                        (`client_op_id`, `device_id`, `operation_type`, `entity_type`, `entity_id`, `payload_json`, `processing_status`, `response_metadata_json`, `client_timestamp`)
+                        VALUES (:op_id, :device_id, :op_type, :entity_type, :eid, :payload, 'applied', :meta, NOW())");
+                    $syncLog->execute([
+                        'op_id' => $opId,
+                        'device_id' => $deviceId,
+                        'op_type' => $opType,
+                        'entity_type' => $entityType,
+                        'eid' => $newBillId,
+                        'payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+                        'meta' => json_encode(['bill_id' => $newBillId, 'bill_no' => $billNo]),
+                    ]);
+
+                    $pdo->commit();
+                    $results[] = ['client_op_id' => $opId, 'status' => 'applied', 'bill_id' => $newBillId];
+
+                } elseif ($entityType === 'inventory' && $opType === 'stock_receive') {
+                    // Stock receive sync
+                    $pid = (int)($payload['product_id'] ?? 0);
+                    $addQty = (float)($payload['quantity'] ?? 0);
+                    if ($pid > 0 && $addQty > 0) {
+                        $pdo->beginTransaction();
+                        $pdo->prepare("UPDATE `products` SET `stock_qty` = `stock_qty` + :qty, `version` = `version` + 1 WHERE `id` = :id")
+                            ->execute(['qty' => $addQty, 'id' => $pid]);
+
+                        $balSt = $pdo->prepare("SELECT stock_qty FROM `products` WHERE id = :id");
+                        $balSt->execute(['id' => $pid]);
+                        $newBal = (float)$balSt->fetchColumn();
+
+                        $pdo->prepare("INSERT INTO `stock_movements` (`client_op_id`, `product_id`, `quantity_delta`, `balance_after`, `reason`, `operation_type`, `device_id`)
+                            VALUES (:op_id, :pid, :delta, :bal, :reason, 'purchase_receive', :did)")
+                            ->execute([
+                                'op_id' => $opId,
+                                'pid' => $pid,
+                                'delta' => $addQty,
+                                'bal' => $newBal,
+                                'reason' => $payload['reason'] ?? 'Offline Sync Stock Receive',
+                                'did' => $deviceId,
+                            ]);
+
+                        $pdo->prepare("INSERT INTO `sync_operations` (`client_op_id`, `device_id`, `operation_type`, `entity_type`, `entity_id`, `payload_json`, `processing_status`, `client_timestamp`)
+                            VALUES (:op_id, :did, :op_type, :entity_type, :pid, :payload, 'applied', NOW())")
+                            ->execute([
+                                'op_id' => $opId,
+                                'did' => $deviceId,
+                                'op_type' => $opType,
+                                'entity_type' => $entityType,
+                                'pid' => $pid,
+                                'payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+                            ]);
+
+                        $pdo->commit();
+                        $results[] = ['client_op_id' => $opId, 'status' => 'applied', 'new_stock' => $newBal];
+                    } else {
+                        $results[] = ['client_op_id' => $opId, 'status' => 'error', 'message' => 'Invalid receive payload'];
+                    }
+
+                } else {
+                    // Default fallback registry
+                    $log = $pdo->prepare("INSERT INTO `sync_operations`
+                        (`client_op_id`, `device_id`, `operation_type`, `entity_type`, `payload_json`, `processing_status`, `client_timestamp`)
+                        VALUES (:op_id, :device_id, :op_type, :entity_type, :payload, 'applied', NOW())");
+                    $log->execute([
+                        'op_id' => $opId,
+                        'device_id' => $deviceId,
+                        'op_type' => $opType,
+                        'entity_type' => $entityType,
+                        'payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+                    ]);
+
+                    $results[] = ['client_op_id' => $opId, 'status' => 'applied'];
+                }
             }
 
             jsonResponse([
@@ -731,7 +1005,7 @@ try {
             break;
 
         // =================================================================
-        // 4.9 SHOP SETTINGS
+        // 4.11 SHOP SETTINGS
         // =================================================================
         case ($resource === 'settings' && $method === 'GET'):
             $stmt = $pdo->query("SELECT setting_key, setting_value, category FROM `settings` WHERE `shop_id` = 1");
@@ -768,6 +1042,6 @@ try {
     if (isset($pdo) && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
-    // Return safe message without leaking internal trace
+    // Return safe message without leaking internal database secrets or SQL queries
     errorResponse("Server Error: " . $e->getMessage(), 500);
 }
